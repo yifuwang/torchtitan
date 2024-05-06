@@ -12,6 +12,7 @@ import time
 import torch
 from torchtitan.config_manager import JobConfig
 from torchtitan.logging_utils import logger
+from torchtitan.trace_handler import trace_handler
 
 # the number of warmup steps before the active step in each profiling cycle
 WARMUP = 3
@@ -33,23 +34,23 @@ def maybe_enable_profiling(config: JobConfig, *, global_step: int = 0):
 
         rank = torch.distributed.get_rank()
 
-        def trace_handler(prof):
-            curr_trace_dir_name = "iteration_" + str(prof.step_num)
-            curr_trace_dir = os.path.join(trace_dir, curr_trace_dir_name)
-            if not os.path.exists(curr_trace_dir):
-                os.makedirs(curr_trace_dir, exist_ok=True)
+        # def trace_handler(prof):
+        #     curr_trace_dir_name = "iteration_" + str(prof.step_num)
+        #     curr_trace_dir = os.path.join(trace_dir, curr_trace_dir_name)
+        #     if not os.path.exists(curr_trace_dir):
+        #         os.makedirs(curr_trace_dir, exist_ok=True)
 
-            logger.info(f"Dumping traces at step {prof.step_num}")
-            begin = time.monotonic()
-            prof.export_chrome_trace(f"{curr_trace_dir}/rank{rank}_trace.json")
-            logger.info(
-                f"Finished dumping traces in {time.monotonic() - begin:.2f} seconds"
-            )
-            # Profiling is a heavy operation which could cost very different amount of time
-            # across all ranks. Insert a barrier to make sure all ranks have finished profiling
-            # before moving on.
-            # TODO: Can we find a cleaner way?
-            torch.distributed.barrier()
+        #     logger.info(f"Dumping traces at step {prof.step_num}")
+        #     begin = time.monotonic()
+        #     prof.export_chrome_trace(f"{curr_trace_dir}/rank{rank}_trace.json")
+        #     logger.info(
+        #         f"Finished dumping traces in {time.monotonic() - begin:.2f} seconds"
+        #     )
+        #     # Profiling is a heavy operation which could cost very different amount of time
+        #     # across all ranks. Insert a barrier to make sure all ranks have finished profiling
+        #     # before moving on.
+        #     # TODO: Can we find a cleaner way?
+        #     torch.distributed.barrier()
 
         logger.info(f"Profiling active. Traces will be saved at {trace_dir}")
 
