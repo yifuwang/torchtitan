@@ -418,6 +418,15 @@ def apply_tp(
         torch._inductor.config._micro_pipeline_tp = True
         enable_symm_mem_for_group(tp_mesh.get_group().group_name)
 
+    from torch.distributed._symmetric_memory import enable_symm_mem_for_group
+    enable_symm_mem_for_group(tp_mesh.get_group().group_name)
+    torch._inductor.config.reorder_for_compute_comm_overlap = True
+    torch._inductor.config.reorder_for_compute_comm_overlap_passes = [
+        # "raise_comms_and_sink_waits",
+        "reorder_compute_for_overlap",
+    ]
+    torch._inductor.config.triton.unique_kernel_names = True
+
     logger.info("Applied Tensor Parallelism to the model")
     return model
 

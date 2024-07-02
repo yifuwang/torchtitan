@@ -275,6 +275,10 @@ def main(job_config: JobConfig):
     for model in model_parts:
         model.to_empty(device=init_device)
 
+    if job_config.training.tensor_parallel_degree == world_size:
+        for model in model_parts:
+            model.to(torch.bfloat16)
+
     if parallel_dims.pp_enabled:
         pp_schedule = build_pipeline_schedule(
             job_config, parallel_dims, stages, loss_fn
