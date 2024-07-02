@@ -41,7 +41,7 @@ llama3_configs = {
     ),
     "70B": ModelArgs(
         dim=8192,
-        n_layers=80,
+        n_layers=8,
         n_heads=64,
         n_kv_heads=8,
         ffn_dim_multiplier=1.3,
