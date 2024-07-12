@@ -497,8 +497,101 @@ def main(job_config: JobConfig):
     logger.info("Training completed")
 
 
+from functools import partial
+from torch._C._distributed_c10d import _SymmetricMemory
+
+import torch
+import torch.distributed as dist
+
+from torch.distributed._functional_collectives import all_gather_tensor, reduce_scatter_tensor, wait_tensor
+from torch.distributed._symmetric_memory import enable_symm_mem_for_group
+from torch.testing._internal.common_utils import get_cycles_per_ms
+
+
+WARMUP_ITERS = 250
+PROF_ITERS = 50
+
+
+def do_bench(config, fn):
+    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device="cuda")
+    begin_evts = [torch.cuda.Event(enable_timing=True) for _ in range(PROF_ITERS)]
+    end_evts = [torch.cuda.Event(enable_timing=True) for _ in range(PROF_ITERS)]
+
+    for _ in range(WARMUP_ITERS):
+        fn()
+    dist.barrier()
+    torch.cuda.synchronize()
+
+    for i in range(PROF_ITERS):
+        cache.zero_()
+        begin_evts[i].record()
+        fn()
+        end_evts[i].record()
+    torch.cuda.synchronize()
+
+    return sum(b.elapsed_time(e) for b, e in zip(begin_evts, end_evts)) / PROF_ITERS
+
+
+def bench_and_prof(config, baseline_fn, fn):
+    baseline_res, res = baseline_fn(), fn()
+    print(baseline_res)
+    print(res)
+
+    fn_ms = do_bench(config, fn)
+    baseline_fn_ms = do_bench(config, baseline_fn)
+    print(f"baseline_fn: {baseline_fn_ms:.3f} ms, fn: {fn_ms:.3f} ms")
+
+    with maybe_enable_profiling(config):
+        for _ in range(PROF_ITERS):
+            baseline_fn()
+        torch.cuda.synchronize()
+        for _ in range(PROF_ITERS):
+            fn()
+        torch.cuda.synchronize()
+
+
+def benchmark(config: JobConfig):
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+    torch.manual_seed(42 + rank)
+
+    mesh = dist.init_device_mesh("cuda", [world_size // 8, 8])
+    outer_group = mesh.get_group(0)
+    inner_group = mesh.get_group(1)
+    enable_symm_mem_for_group(inner_group.group_name)
+
+    def all_gather(*args):
+        return wait_tensor(all_gather_tensor(*args))
+
+    t = _SymmetricMemory.empty_strided_p2p(
+        size=(8192, 8192),
+        stride=(8192, 1),
+        dtype=torch.float16,
+        device=device,
+        group_name=inner_group.group_name,
+    ).normal_(mean=0, std=1)
+
+    bench_and_prof(
+        config,
+        baseline_fn=partial(
+            all_gather, t, 0, "0"
+        ),
+        fn=partial(
+            all_gather, t, 0, "0"
+        ),
+    )
+    print("yo")
+
+
 if __name__ == "__main__":
     config = JobConfig()
     config.parse_args()
-    main(config)
+    # main(config)
+    config.profiling.enable_profiling = True
+    benchmark(config)
     destroy_process_group()
