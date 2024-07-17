@@ -628,9 +628,6 @@ def benchmark(config: JobConfig):
 
 
     def hierarchical_all_gather(output, input, inner_group, outer_group):
-        # workspace = get_symm_mem_workspace(inner_group.group_name, input.numel() * input.element_size() * outer_group.size())
-        # inner_res = workspace.get_buffer(workspace.rank, (input.shape[0] * outer_group.size(), *input.shape[1:]), input.dtype)
-        # return dist.all_gather_into_tensor(inner_res, input, group=outer_group)
         outer_res = input.new_empty(input.shape[0] * outer_group.size(), *input.shape[1:])
         outer_work = dist.all_gather_into_tensor(outer_res, input, group=outer_group, async_op=True)
 
@@ -641,7 +638,6 @@ def benchmark(config: JobConfig):
             workspace.barrier()
             buf = workspace.get_buffer(workspace.rank, input.shape, input.dtype, input.numel() * outer_group.rank())
             buf.copy_(input)
-            # local_gather_res = torch.ops.symm_mem._low_contention_all_gather(input, inner_group.group_name)
         outer_work.wait()
 
         # Push based local permutation
@@ -667,7 +663,7 @@ def benchmark(config: JobConfig):
         return res
 
 
-    NUMEL = 256 * 1024 ** 2
+    NUMEL = 1024 * 1024 ** 2
     t = _SymmetricMemory.empty_strided_p2p(
         size=(NUMEL // world_size,),
         stride=(1,),
