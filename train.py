@@ -519,6 +519,7 @@ def do_bench(config, fn):
 
     for _ in range(WARMUP_ITERS):
         fn()
+
     dist.barrier()
     torch.cuda.synchronize()
 
@@ -544,14 +545,68 @@ def bench_and_prof(config, baseline_fn, fn):
     with maybe_enable_profiling(config):
         for _ in range(PROF_ITERS):
             baseline_fn()
+
+        dist.barrier()
         torch.cuda.synchronize()
+
         for _ in range(PROF_ITERS):
             fn()
         torch.cuda.synchronize()
 
 
-def benchmark(config: JobConfig):
+from torch.distributed._symmetric_memory import get_symm_mem_workspace, _get_backend_stream
 
+
+def _low_contention_all_gather_out(
+    tensor: torch.Tensor,
+    group_name: str,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    from torch.distributed._symmetric_memory import _SymmetricMemory, Work
+    """
+    Performs all-gather with symmetric memory in a low-contention fashion.
+
+    When `tensor` is already in symmetric memory:
+        - The collective is carried out without using SMs.
+        - No symmetric memory workspace is required.
+
+    When `tensor` is not in symmetric memory:
+        - An extra SM-based copy is performed to copy the input data into the
+          symmetric memory workspace.
+        - Symmetric memory workspace size requirement: the size of `tensor`.
+    """
+    symm_mem = _SymmetricMemory.rendezvous(tensor)
+    if symm_mem is not None:
+        input_is_symm_mem = True
+    else:
+        symm_mem = get_symm_mem_workspace(
+            group_name, tensor.numel() * tensor.element_size()
+        )
+        input_is_symm_mem = False
+
+    rank = symm_mem.rank
+    world_size = symm_mem.world_size
+
+    # output = tensor.new_empty(tensor.shape[0] * world_size, *tensor.shape[1:])
+    chunks = output.chunk(world_size)
+
+    _get_backend_stream().wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(_get_backend_stream()):
+        if not input_is_symm_mem:
+            local_buf = symm_mem.get_buffer(rank, tensor.shape, tensor.dtype)
+            local_buf.copy_(tensor)
+        # pull
+        symm_mem.barrier()
+        for step in range(0, world_size):
+            remote_rank = (rank - step) % world_size
+            src_buf = symm_mem.get_buffer(remote_rank, tensor.shape, tensor.dtype)
+            chunks[remote_rank].copy_(src_buf)
+        symm_mem.barrier()
+        torch._C._distributed_c10d._register_work(output, Work())
+        return output
+
+
+def benchmark(config: JobConfig):
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -560,7 +615,10 @@ def benchmark(config: JobConfig):
     torch.cuda.set_device(device)
     torch.manual_seed(42 + rank)
 
-    mesh = dist.init_device_mesh("cuda", [world_size // 8, 8])
+    if world_size == 8:
+        mesh = dist.init_device_mesh("cuda", [2, 4])
+    else:
+        mesh = dist.init_device_mesh("cuda", [world_size // 8, 8])
     outer_group = mesh.get_group(0)
     inner_group = mesh.get_group(1)
     enable_symm_mem_for_group(inner_group.group_name)
@@ -568,9 +626,59 @@ def benchmark(config: JobConfig):
     def all_gather(*args):
         return wait_tensor(all_gather_tensor(*args))
 
+
+    def hierarchical_all_gather(output, input, inner_group, outer_group):
+        # workspace = get_symm_mem_workspace(inner_group.group_name, input.numel() * input.element_size() * outer_group.size())
+        # inner_res = workspace.get_buffer(workspace.rank, (input.shape[0] * outer_group.size(), *input.shape[1:]), input.dtype)
+        # return dist.all_gather_into_tensor(inner_res, input, group=outer_group)
+        outer_res = input.new_empty(input.shape[0] * outer_group.size(), *input.shape[1:])
+        outer_work = dist.all_gather_into_tensor(outer_res, input, group=outer_group, async_op=True)
+
+        workspace = get_symm_mem_workspace(inner_group.group_name, outer_res.numel() * outer_res.element_size())
+
+        # Issue the first barrier concurrently
+        with torch.cuda.stream(_get_backend_stream()):
+            workspace.barrier()
+            buf = workspace.get_buffer(workspace.rank, input.shape, input.dtype, input.numel() * outer_group.rank())
+            buf.copy_(input)
+            # local_gather_res = torch.ops.symm_mem._low_contention_all_gather(input, inner_group.group_name)
+        outer_work.wait()
+
+        # Push based local permutation
+        chunks = outer_res.chunk(outer_group.size())
+        _get_backend_stream().wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(_get_backend_stream()):
+            for step in range(outer_group.size()):
+                # Load balancing - each rank should have 1 send + 1 recv at each step
+                step = (step + outer_group.rank()) % outer_group.size()
+
+                chunk_rank = workspace.world_size * step + workspace.rank
+                if chunk_rank == dist.group.WORLD.rank():
+                    continue
+                dst_rank = chunk_rank // outer_group.size()
+                dst_off = (chunk_rank % outer_group.size()) * input.numel()
+                dst_buf = workspace.get_buffer(dst_rank, input.shape, input.dtype, dst_off)
+                dst_buf.copy_(chunks[step])
+            workspace.barrier()
+
+        buf = workspace.get_buffer(workspace.rank, outer_res.shape, outer_res.dtype)
+        res = torch.ops.symm_mem._low_contention_all_gather(buf, inner_group.group_name)
+        torch.ops._c10d_functional.wait_tensor(res)
+        return res
+
+
+    NUMEL = 256 * 1024 ** 2
     t = _SymmetricMemory.empty_strided_p2p(
-        size=(8192, 8192),
-        stride=(8192, 1),
+        size=(NUMEL // world_size,),
+        stride=(1,),
+        dtype=torch.float16,
+        device=device,
+        group_name=inner_group.group_name,
+    ).normal_(mean=0, std=1)
+
+    output = _SymmetricMemory.empty_strided_p2p(
+        size=(NUMEL,),
+        stride=(1,),
         dtype=torch.float16,
         device=device,
         group_name=inner_group.group_name,
@@ -582,7 +690,7 @@ def benchmark(config: JobConfig):
             all_gather, t, 0, "0"
         ),
         fn=partial(
-            all_gather, t, 0, "0"
+            hierarchical_all_gather, output, t, inner_group, outer_group
         ),
     )
     print("yo")
