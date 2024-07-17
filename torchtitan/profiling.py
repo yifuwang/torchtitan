@@ -56,21 +56,21 @@ def maybe_enable_profiling(config: JobConfig, *, global_step: int = 0):
         if not os.path.exists(trace_dir):
             os.makedirs(trace_dir, exist_ok=True)
 
-        warmup, active = WARMUP, 1
-        wait = profile_freq - (active + warmup)
-        assert (
-            wait >= 0
-        ), "profile_freq must be greater than or equal to warmup + active"
+        # warmup, active = WARMUP, 1
+        # wait = profile_freq - (active + warmup)
+        # assert (
+        #     wait >= 0
+        # ), "profile_freq must be greater than or equal to warmup + active"
         with torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
-            schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active),
+            # schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active),
             on_trace_ready=trace_handler,
             record_shapes=True,
         ) as torch_profiler:
-            torch_profiler.step_num = global_step
+            # torch_profiler.step_num = global_step
             yield torch_profiler
     else:
         torch_profiler = contextlib.nullcontext()

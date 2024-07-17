@@ -534,8 +534,6 @@ def do_bench(config, fn):
 
 def bench_and_prof(config, baseline_fn, fn):
     baseline_res, res = baseline_fn(), fn()
-    print(baseline_res)
-    print(res)
 
     fn_ms = do_bench(config, fn)
     baseline_fn_ms = do_bench(config, baseline_fn)
@@ -552,40 +550,79 @@ def bench_and_prof(config, baseline_fn, fn):
 
 def benchmark(config: JobConfig):
 
-    local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
 
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
     torch.manual_seed(42 + rank)
 
+    dist.init_process_group("nccl")
     mesh = dist.init_device_mesh("cuda", [world_size // 8, 8])
+    # mesh = dist.init_device_mesh("cuda", [2, 4])
     outer_group = mesh.get_group(0)
     inner_group = mesh.get_group(1)
     enable_symm_mem_for_group(inner_group.group_name)
 
-    def all_gather(*args):
-        return wait_tensor(all_gather_tensor(*args))
+    print(f"outer_group: {outer_group.size()}")
+    print(f"inner_group: {inner_group.size()}")
 
-    t = _SymmetricMemory.empty_strided_p2p(
-        size=(8192, 8192),
-        stride=(8192, 1),
-        dtype=torch.float16,
-        device=device,
-        group_name=inner_group.group_name,
-    ).normal_(mean=0, std=1)
+    NUMEL = 64 * 1024 * 1024 // 2
+
+    input = torch.empty(NUMEL, dtype=torch.bfloat16, device=device)
+    output = torch.empty(NUMEL, dtype=torch.bfloat16, device=device)
+
+    dist.all_reduce(input)
+    torch.cuda.synchronize()
+    print("all-reduce done")
+    return
+
+    from torch._C._distributed_c10d import _empty_strided_nccl
+    reg_input = _empty_strided_nccl(
+        (NUMEL,),
+        (1,),
+        torch.bfloat16,
+        device,
+        outer_group,
+    )
+
+    reg_output = _empty_strided_nccl(
+        (NUMEL,),
+        (1,),
+        torch.bfloat16,
+        device,
+        outer_group,
+    )
+
+    def permute(output, input, group):
+        rank = group.rank()
+        world_size = group.size()
+
+        send_sizes = [0] * world_size
+        recv_sizes = [0] * world_size
+        prev = (rank - 1) % world_size
+        next = (rank + 1) % world_size
+        send_sizes[next] = input.numel()
+        recv_sizes[prev] = input.numel()
+
+        output = torch.empty_like(input)
+        group.alltoall_base(
+            output,
+            input,
+            output_split_sizes=recv_sizes,
+            input_split_sizes=send_sizes,
+        ).wait()
 
     bench_and_prof(
         config,
         baseline_fn=partial(
-            all_gather, t, 0, "0"
+            permute, output, input, outer_group,
         ),
         fn=partial(
-            all_gather, t, 0, "0"
+            permute, reg_output, reg_input, outer_group,
         ),
     )
-    print("yo")
 
 
 if __name__ == "__main__":
