@@ -663,6 +663,53 @@ def benchmark(config: JobConfig):
         return res
 
 
+    def hierarchical_all_gather2(output, input, inner_group, outer_group):
+        # NOTE: not working yet
+        outer_rank = outer_group.rank()
+        inner_rank = inner_group.rank()
+        outer_size = outer_group.size()
+        inner_size = inner_group.size()
+
+        output = input.new_empty(input.shape[0] * outer_size * inner_size, *input.shape[1:])
+        output_chunks = output.chunk(outer_size)
+
+        symm_mem = get_symm_mem_workspace(inner_group.group_name, input.numel() * input.element_size() * 2)
+        buf_0 = symm_mem.get_buffer(symm_mem.rank, input.shape, input.dtype)
+        buf_1 = symm_mem.get_buffer(symm_mem.rank, input.shape, input.dtype, input.numel())
+
+        def local_ag(outer_idx, offset):
+            _get_backend_stream().wait_stream(torch.cuda.current_stream())
+            chunks = output_chunks[outer_idx].chunk(inner_size)
+            with torch.cuda.stream(_get_backend_stream()):
+                symm_mem.barrier()
+                for step in range(0, symm_mem.world_size):
+                    remote_rank = (rank - step) % symm_mem.world_size
+                    src_buf = symm_mem.get_buffer(remote_rank, input.shape, input.dtype, offset)
+                    chunks[remote_rank].copy_(src_buf)
+                symm_mem.barrier()
+
+        for step in range(outer_size - 1):
+            outer_idx = (outer_rank - step) % outer_size
+
+            send_sizes = [0] * outer_size
+            recv_sizes = [0] * outer_size
+            prev = (outer_rank - 1) % outer_size
+            next = (outer_rank + 1) % outer_size
+            send_sizes[next] = input.numel()
+            recv_sizes[prev] = input.numel()
+            work = outer_group.alltoall_base(
+                buf_1.view(-1),
+                input.view(-1),
+                output_split_sizes=recv_sizes,
+                input_split_sizes=send_sizes,
+            )
+            local_ag(outer_idx, 0 if step % 2 == 0 else input.numel())
+            work.wait()
+            torch.cuda.current_stream().wait_stream(_get_backend_stream())
+
+        return output
+
+
     SIZE_MB = 1024 * 1024 ** 2
     t = _SymmetricMemory.empty_strided_p2p(
         size=(SIZE_MB // 2 // world_size,),
