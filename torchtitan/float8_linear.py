@@ -53,6 +53,8 @@ def maybe_build_fp8_linear(
 
     This will mutate the model inplace.
     """
+    import float8_experimental.config as config
+    config.enable_fsdp_fp8_all_gather = True
     enable_float8_linear = job_config.training.enable_float8_linear
     if not enable_float8_linear:
         return
@@ -72,10 +74,11 @@ def maybe_build_fp8_linear(
         enable_fsdp_float8_all_gather = (
             job_config.training.enable_fsdp_float8_all_gather and dp_enabled
         )
-        with set_enable_fsdp_float8_all_gather(enable_fsdp_float8_all_gather):
-            swap_linear_with_float8_linear(
-                model, scaling_type_w=TensorScalingType.DYNAMIC
-            )
+        # with set_enable_fsdp_float8_all_gather(enable_fsdp_float8_all_gather):
+        
+        swap_linear_with_float8_linear(
+            model, scaling_type_w=TensorScalingType.DYNAMIC
+        )
         logger.info(
             f"Swapped to Float8Linear layers with {enable_fsdp_float8_all_gather=}"
         )
